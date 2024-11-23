@@ -9,11 +9,13 @@
  * Contributing: http://www.plupload.com/contributing
  */
 
+session_start();
 
 define('__ROOT__', dirname(dirname(__FILE__)));
 require_once(__ROOT__.'/scripts/common.php');
 ensure_authenticated('You must be authenticated to upload backup files.');
 $home = get_home();
+$user = get_user();
 
 
 // Make sure file is not cached (as it happens for example on iOS devices)
@@ -23,72 +25,29 @@ header("Cache-Control: no-store, no-cache, must-revalidate");
 header("Cache-Control: post-check=0, pre-check=0", false);
 header("Pragma: no-cache");
 
-/* 
-// Support CORS
-header("Access-Control-Allow-Origin: *");
-// other CORS headers if any...
-if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
-	exit; // finish preflight CORS requests here
-}
-*/
-
 // 5 minutes execution time
 @set_time_limit(5 * 60);
 
 // Uncomment this one to fake upload time
 // usleep(5000);
 
-// Settings
-$targetDir = "$home/BirdNET-Pi/uploads";
-//$targetDir = 'uploads';
-$cleanupTargetDir = true; // Remove old files
-$maxFileAge = 5 * 3600; // Temp file age in seconds
-
-
-// Create target dir
-if (!file_exists($targetDir)) {
-	@mkdir($targetDir);
-}
-
-// Get a file name
-if (isset($_REQUEST["name"])) {
-	$fileName = $_REQUEST["name"];
-} elseif (!empty($_FILES)) {
-	$fileName = $_FILES["file"]["name"];
-} else {
-	$fileName = uniqid("file_");
-}
-
-$filePath = $targetDir . DIRECTORY_SEPARATOR . $fileName;
-
 // Chunking might be enabled
 $chunk = isset($_REQUEST["chunk"]) ? intval($_REQUEST["chunk"]) : 0;
 $chunks = isset($_REQUEST["chunks"]) ? intval($_REQUEST["chunks"]) : 0;
 
+$pipe="/tmp/bird_pipe";
+if ($chunk == 0) {
+    @unlink($pipe);
+    if (!posix_mkfifo($pipe, 0660)){
+        die('{"jsonrpc" : "2.0", "error" : {"code": 100, "message": "Failed to open temp directory."}, "id" : "id"}');
+    }
 
-// Remove old temp files	
-if ($cleanupTargetDir) {
-	if (!is_dir($targetDir) || !$dir = opendir($targetDir)) {
-		die('{"jsonrpc" : "2.0", "error" : {"code": 100, "message": "Failed to open temp directory."}, "id" : "id"}');
-	}
-
-	while (($file = readdir($dir)) !== false) {
-		$tmpfilePath = $targetDir . DIRECTORY_SEPARATOR . $file;
-
-		// If temp file is current file proceed to the next
-		if ($tmpfilePath == "{$filePath}.part") {
-			continue;
-		}
-
-		// Remove all files, since not the current file
-		unlink($tmpfilePath);
-	}
-	closedir($dir);
-}	
-
+    $pID = shell_exec("nohup $home/BirdNET-Pi/scripts/read_chunks.sh -n $chunks -f $pipe | sudo -u $user $home/BirdNET-Pi/scripts/backup_data.sh -a restore -f - > $home/BirdSongs/restore.log 2> /dev/null & echo $!");
+    $_SESSION['pID'] = $pID;
+}
 
 // Open temp file
-if (!$out = @fopen("{$filePath}.part", $chunks ? "ab" : "wb")) {
+if (!$out = @fopen("{$pipe}", $chunks ? "ab" : "wb")) {
 	die('{"jsonrpc" : "2.0", "error" : {"code": 102, "message": "Failed to open output stream."}, "id" : "id"}');
 }
 
@@ -116,8 +75,17 @@ while ($buff = fread($in, 4096)) {
 
 // Check if file has been uploaded
 if (!$chunks || $chunk == $chunks - 1) {
-	// Strip the temp .part suffix off 
-	rename("{$filePath}.part", $filePath);
+    $pID = $_SESSION['pID'];
+    exec("ps $pID", $ProcessState);
+
+    $i = 0;
+    while ($i < 100 && count($ProcessState) >= 2) {
+        unset($ProcessState);
+        exec("ps $pID", $ProcessState);
+        $i++;
+        usleep(200000);
+    }
+    unlink($pipe);
 }
 
 // Return Success JSON-RPC response
